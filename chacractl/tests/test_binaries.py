@@ -36,21 +36,20 @@ class FakeServer(object):
     answers 404 for a listing with no binaries.
     """
 
-    def __init__(self, monkeypatch, checksums, posts=(), listing_status=200):
+    def __init__(self, monkeypatch, checksums, puts=(), listing_status=200):
         self.checksums = list(checksums)
-        self.posts = list(posts)
+        self.puts = list(puts)
         self.listing_status = listing_status
-        self.posted_fields = []
-        self.puts = 0
+        self.put_headers = []
         self.deletes = 0
-        monkeypatch.setattr(binaries.requests, 'post', self.post)
+        monkeypatch.setattr(binaries.requests, 'put', self.put)
         monkeypatch.setattr(binaries.requests, 'get', self.get)
-        monkeypatch.setattr(binaries.Binary, 'put', self.put)
         monkeypatch.setattr(binaries.Binary, 'delete', self.delete)
 
-    def post(self, url, data, **kw):
-        self.posted_fields.append(set(data.fields))
-        return FakeResponse(self.posts.pop(0))
+    def put(self, url, data, headers, **kw):
+        assert url == URL + FILENAME + '/'
+        self.put_headers.append(headers)
+        return FakeResponse(self.puts.pop(0))
 
     def get(self, *args, **kw):
         if self.listing_status != 200:
@@ -61,9 +60,6 @@ class FakeServer(object):
         if checksum is None:
             return FakeResponse(404)
         return FakeResponse(200, {FILENAME: {'checksum': checksum}})
-
-    def put(self, *args):
-        self.puts += 1
 
     def delete(self, *args):
         self.deletes += 1
@@ -92,44 +88,57 @@ def upload(path, force=False):
 
 class TestPost(object):
 
-    @pytest.mark.parametrize('conflict', [400, 409])
-    def test_retry_after_timeout_finds_upload(self, path, server, conflict):
-        # the proxy gives up with a 504, the retried POST gets a 400, or
-        # a 409 from newer chacra, because the first upload has landed in
-        # the meantime
-        s = server([None, None, DIGEST], posts=[504, conflict])
+    def test_creates_with_precondition(self, path, server):
+        s = server([None, DIGEST], puts=[201])
         upload(path)
-        assert s.posts == []
+        assert s.put_headers[0]['If-None-Match'] == '*'
 
-    def test_existing_upload_with_other_checksum_fails(self, path, server):
-        server([None, 'other'], posts=[400])
-        with pytest.raises(requests.HTTPError):
-            upload(path)
-
-    def test_force_is_sent_with_post(self, path, server):
-        s = server([None, DIGEST], posts=[200])
+    def test_force_replaces_without_precondition(self, path, server):
+        s = server(['other', DIGEST], puts=[200])
         upload(path, force=True)
-        assert s.posted_fields == [{'file', 'force'}]
+        assert 'If-None-Match' not in s.put_headers[0]
 
-    @pytest.mark.parametrize('force,checksum,puts', [
-        (True, DIGEST, 0),
-        (False, 'other', 0),
-        (True, 'other', 1),
+    def test_retry_after_timeout_finds_upload(self, path, server):
+        # the proxy gives up with a 504, the retried PUT fails its
+        # precondition because the first upload has landed meanwhile
+        s = server([None, None, DIGEST], puts=[504, 412])
+        upload(path)
+        assert s.puts == []
+
+    def test_precondition_failed_with_other_checksum_skips(self, path,
+                                                           server):
+        s = server([None, 'other'], puts=[412])
+        upload(path)
+        assert s.puts == []
+
+    @pytest.mark.parametrize('force,checksum', [
+        (True, DIGEST),
+        (False, 'other'),
     ])
-    def test_existing_upload(self, path, server, force, checksum, puts):
+    def test_existing_upload_is_skipped(self, path, server, force,
+                                        checksum):
         s = server([checksum])
         upload(path, force)
-        assert s.posted_fields == []
-        assert s.puts == puts
+        assert s.put_headers == []
 
     def test_listing_error_fails(self, path, server):
         s = server([DIGEST], listing_status=502)
         with pytest.raises(requests.HTTPError):
             upload(path)
-        assert s.posted_fields == []
+        assert s.put_headers == []
 
     def test_missing_upload_is_not_deleted(self, path, server):
-        s = server([None], posts=[201])
+        s = server([None], puts=[201])
         with pytest.raises(SystemExit, match='not found on the server'):
             upload(path)
         assert s.deletes == 0
+
+    @pytest.mark.parametrize('force,status,deletes', [
+        (False, 201, 1),
+        (True, 200, 0),
+    ])
+    def test_corrupted_upload(self, path, server, force, status, deletes):
+        s = server([None, 'corrupted'], puts=[status])
+        with pytest.raises(SystemExit, match='Checksum mismatch'):
+            upload(path, force)
+        assert s.deletes == deletes

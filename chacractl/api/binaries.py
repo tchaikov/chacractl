@@ -110,76 +110,50 @@ class Binary(object):
         if remote_digest == digest:
             return self.skip(
                 file_url, 'resource exists with the same checksum')
-        if remote_digest is not None:
-            if self.force:
-                return self.put(file_url, filepath, digest)
+        if remote_digest is not None and not self.force:
             log_checksum_mismatch(filename, digest, remote_digest)
             return self.skip(
                 file_url, 'resource exists and --force was not used')
 
-        length = os.path.getsize(filepath)
-        logger.info('POSTing file: %s', filepath)
-        fields = {'file': (filename, open(filepath, 'rb'), 'text/plain')}
-        if self.force:
-            fields['force'] = 'true'
-        mpart = MultipartEncoder(fields=fields)
-
-        response = requests.post(
-            url,
-            data=mpart,
-            headers={
-                'Content-Type': mpart.content_type,
-                'Content-Length': '%d' % length,
-            },
-            auth=chacractl.config['credentials'],
-            verify=chacractl.config['ssl_verify'])
+        headers = {} if self.force else {'If-None-Match': '*'}
+        response = self.put(file_url, filepath, headers)
+        if response.status_code == 412:
+            remote_digest = self.get_remote_checksum(url, filename)
+            if remote_digest == digest:
+                return self.skip(
+                    file_url,
+                    'resource already exists with the same checksum, '
+                    'probably uploaded by an earlier attempt')
+            if remote_digest is not None:
+                log_checksum_mismatch(filename, digest, remote_digest)
+                return self.skip(
+                    file_url, 'resource exists and --force was not used')
         if response.status_code > 201:
             logger.warning("%s -> %s", response.status_code, response.text)
-            if response.status_code in (400, 409):
-                remote_digest = self.get_remote_checksum(url, filename)
-                if remote_digest == digest:
-                    return self.skip(
-                        file_url,
-                        'resource already exists with the same checksum, '
-                        'probably uploaded by an earlier attempt')
-                if remote_digest is not None:
-                    log_checksum_mismatch(filename, digest, remote_digest)
             response.raise_for_status()
         if not self.upload_is_verified(url, filename, digest):
-            # Since this is a new file, attempt to delete it
-            logging.error('Deleting corrupted file from server...')
-            self.delete(file_url)
+            if response.status_code == 201:
+                # Since this is a new file, attempt to delete it
+                logging.error('Deleting corrupted file from server...')
+                self.delete(file_url)
             raise SystemExit(
                     'Checksum mismatch: remote server has wrong checksum for %s'
                     % filepath)
-    @retry()
-    def put(self, url, filepath, digest):
+
+    def put(self, file_url, filepath, headers):
         filename = os.path.basename(filepath)
-        logger.info('resource exists and --force was used, will re-upload')
         logger.info('PUTing file: %s', filepath)
-        length = os.path.getsize(filepath)
-        mpart = MultipartEncoder(
-            fields={'file': (filename, open(filepath, 'rb'), 'text/plain')}
-        )
-        response = requests.put(
-            url,
-            data=mpart,
-            headers={
-                'Content-Type': mpart.content_type,
-                'Content-Length': '%d' % length,
-            },
-            auth=chacractl.config['credentials'],
-            verify=chacractl.config['ssl_verify'])
-        if response.status_code > 201:
-            logger.warning("%s -> %s", response.status_code, response.text)
-        # trim off binary filename
-        url = url.rsplit('/', 2)[0] + "/"
-        if not self.upload_is_verified(url, filename, digest):
-            # Maybe the old file with a different digest is still there, so
-            # don't delete it
-            raise SystemExit(
-                    'Checksum mismatch: server has wrong checksum for %s!'
-                    % filepath)
+        with open(filepath, 'rb') as f:
+            mpart = MultipartEncoder(
+                fields={'file': (filename, f, 'text/plain')}
+            )
+            return requests.put(
+                file_url,
+                data=mpart,
+                headers=dict(headers, **{'Content-Type': mpart.content_type}),
+                auth=chacractl.config['credentials'],
+                verify=chacractl.config['ssl_verify'])
+
     @retry()
     def delete(self, url):
         exists = requests.head(url, verify=chacractl.config['ssl_verify'])
